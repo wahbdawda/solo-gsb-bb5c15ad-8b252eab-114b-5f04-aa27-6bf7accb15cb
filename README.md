@@ -7,7 +7,9 @@ FastAPI 服务：接收 Intel HEX 文本，逐行校验（字节数 + 二补校�
 逐条回放 NOR Flash 状态、校验其合法性并确认最终映像与目标一致；还能按 Cortex-M 向量表
 语义校验映像中的向量表
 （初始栈顶、复位向量、Thumb 位与 ram/executable 区域归属），或将多个带唯一名称的
-Intel HEX 映像按绝对地址叠加合并（同值归并并记录全部来源、冲突按连续段报告、入口一致性校验）。
+Intel HEX 映像按绝对地址叠加合并（同值归并并记录全部来源、冲突按连续段报告、入口一致性校验），
+还可对映像计算**规范化内容指纹**：稀疏段按地址升序编码为明确的「地址、长度、字节」帧后求
+整像 SHA-256，同一映像无论记录如何分片、空洞如何表示都得到相同指纹。
 
 ## 快速启动（单条命令）
 
@@ -600,6 +602,60 @@ curl -s -X POST http://localhost:8000/api/v1/merge-images \
 - 冲突与 `entry_conflict` 可同时出现；只要任一存在，`ok=false` 且不生成
   `merged_segments` 字段。
 
+### `POST /api/v1/image-digest`
+
+固件内容指纹：复用同一 Intel HEX 解析器组装映像后，把**稀疏段按地址升序**编码为
+明确的「地址、长度、字节」二进制帧并计算整像 SHA-256。同一映像无论记录如何分片、
+使用 02 还是 04 基址记录、记录顺序与空洞如何表示，组装结果相同则指纹相同。
+`include_entry`（默认 `true`）为 `false` 时入口地址不参与整像哈希（仍照常返回）。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/image-digest \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "hex_text": ":020000040800F2\n:10000000214601360121470136007EFE09D2190141\n:04000005080001C12D\n:00000001FF\n",
+    "include_entry": true
+  }' | jq
+```
+
+规范化编码（供外部复算）：
+
+- 字节流以版本标签 `FWDIG1\0` 开头；
+- 每个段一帧：`"S" + start(8 字节大端) + length(8 字节大端) + 原始字节`，按地址升序；
+- `include_entry=true` 且存在入口时追加入口帧：`"E" + entry(8 字节大端)`；
+- `image_sha256` 为整条字节流的 SHA-256（十六进制），`segments[].sha256` 为各段
+  自身帧的 SHA-256。
+
+上例响应（同样恒为 200）：
+
+```json
+{
+  "ok": true,
+  "hex_ok": true,
+  "include_entry": true,
+  "error_count": 0,
+  "warning_count": 0,
+  "entry_address": 134218177,
+  "total_bytes": 16,
+  "segment_count": 1,
+  "image_sha256": "5d0c5b423f92c798c4984ce8c805f4a819de8991764e171eeb8e572cfd16a26d",
+  "segments": [
+    {"start": 134217728, "end": 134217744, "size": 16,
+     "sha256": "67c346a8d2c9836f3778b2dfc6263302c4412bc18b9ffca52900c562d6d80f51"}
+  ],
+  "manifest": "FWDIG1\nsegment 0x08000000 16 67c346a8d2c9836f3778b2dfc6263302c4412bc18b9ffca52900c562d6d80f51\nentry 0x080001C1",
+  "diagnostics": [ ... ]
+}
+```
+
+- `manifest`：规范化清单，逐行镜像被哈希的帧（`segment <起始地址> <长度> <段摘要>`，
+  入口行 `entry <地址>` 仅在其参与哈希时出现），便于人工核对与归档。
+- `include_entry=false` 时上例整像哈希变为
+  `8f9c5f0cd40f317557ebf18e76a721d3246e0e96be818351894fb2755956040d`，
+  与完全不带入口记录的同一映像一致；清单中不出现 `entry` 行。
+- HEX 无效时只返回 `diagnostics`（`image_sha256`/`manifest` 为 `null`，
+  `segments` 为空），不产出任何摘要。
+
 ## 解析规则
 
 - 每行必须形如 `:llaaaatt<data>cc`；校验 `ll`（字节数）与实际数据长度一致，
@@ -627,6 +683,7 @@ app/
   flash_verify.py # 擦/写操作序列回放校验（逐条合法性、1->0 语义、目标差异合并，纯逻辑）
   vector_table.py # Cortex-M 向量表校验（小端读取、栈顶/复位/Thumb 位与区域归属，纯逻辑）
   image_merge.py  # 多映像按绝对地址叠加合并（同值归并、冲突段报告、入口一致性，纯逻辑）
+  image_digest.py # 固件内容指纹（规范化地址/长度/字节帧编码、整像与分段 SHA-256，纯逻辑）
 tests/
   test_hex_service.py           # 解析器与 assemble 接口
   test_validate_layout.py       # validate-layout 接口与布局逻辑
@@ -635,6 +692,7 @@ tests/
   test_verify_flash_operations.py # verify-flash-operations 接口与回放校验逻辑
   test_validate_vector_table.py # validate-vector-table 接口与向量表校验逻辑
   test_merge_images.py          # merge-images 接口与多映像合并逻辑
+  test_image_digest.py          # image-digest 接口与内容指纹逻辑
 Dockerfile
 docker-compose.yml
 requirements.txt       # 运行依赖

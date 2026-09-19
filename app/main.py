@@ -10,6 +10,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, model_validator
 
 from .hex_parser import ParseResult, parse_intel_hex
+from .image_digest import compute_image_digest
 from .image_merge import MergeSource, merge_images
 from .layout import Region, validate_layout
 from .relocation import plan_relocation
@@ -35,8 +36,10 @@ app = FastAPI(
         "delta whose feasible range is computed against those regions, "
         "diffed against another image to plan NOR-flash erase/write steps, "
         "replayed from a user-supplied ordered erase/write sequence to verify "
-        "it reaches that target, or read as a Cortex-M vector table checked "
-        "against ram/executable memory regions."
+        "it reaches that target, read as a Cortex-M vector table checked "
+        "against ram/executable memory regions, or fingerprinted with a "
+        "canonical SHA-256 over address/length/byte frames so the same image "
+        "hashes identically regardless of record fragmentation or gaps."
     ),
 )
 
@@ -716,6 +719,63 @@ class MergeImagesResponse(BaseModel):
     )
 
 
+class ImageDigestRequest(BaseModel):
+    hex_text: str = Field(..., description="Intel HEX text, one record per line")
+    include_entry: bool = Field(
+        True,
+        description="When false the entry address is still reported but is not "
+        "folded into the whole-image hash",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "hex_text": (
+                        ":020000040800F2\n"
+                        ":10000000214601360121470136007EFE09D2190141\n"
+                        ":04000005080001C12D\n"
+                        ":00000001FF\n"
+                    ),
+                    "include_entry": True,
+                }
+            ]
+        }
+    }
+
+
+class SegmentDigestOut(BaseModel):
+    start: int = Field(..., description="Absolute start address")
+    end: int = Field(..., description="Exclusive end address")
+    size: int
+    sha256: str = Field(
+        ..., description="SHA-256 (hex) of this segment's canonical address/length/bytes frame"
+    )
+
+
+class ImageDigestResponse(BaseModel):
+    ok: bool = Field(..., description="True when the HEX text passed validation")
+    hex_ok: bool = Field(..., description="True when the Intel HEX text passed validation")
+    include_entry: bool = Field(..., description="The entry-inclusion mode that was applied")
+    error_count: int
+    warning_count: int
+    entry_address: int | None = Field(None, description="From the last 03/05 record, if present")
+    total_bytes: int
+    segment_count: int
+    image_sha256: str | None = Field(
+        None,
+        description="SHA-256 (hex) of the canonical frame stream; null on parse failure",
+    )
+    segments: list[SegmentDigestOut] = Field(
+        ..., description="Per-segment digests in ascending address order; empty on parse failure"
+    )
+    manifest: str | None = Field(
+        None,
+        description="Normalized manifest mirroring the hashed frames; null on parse failure",
+    )
+    diagnostics: list[DiagnosticOut]
+
+
 def _build_response(result: ParseResult) -> AssembleResponse:
     return AssembleResponse(
         ok=result.ok,
@@ -1333,3 +1393,57 @@ def merge_images_route(request: MergeImagesRequest) -> dict:
             for s in result.segments
         ]
     return payload
+
+
+@app.post("/api/v1/image-digest", response_model=ImageDigestResponse, tags=["digest"])
+def image_digest_route(request: ImageDigestRequest) -> ImageDigestResponse:
+    """Compute a canonical SHA-256 fingerprint of the assembled image.
+
+    The HEX text is parsed with the shared validator; when it fails
+    only parse diagnostics are returned and no digest is produced.
+    Otherwise the assembled sparse segments are encoded in ascending
+    address order as explicit ``address, length, bytes`` frames and
+    hashed as one stream, so the same image yields the same
+    fingerprint regardless of record fragmentation, base-address
+    record usage or gap representation. With ``include_entry`` true
+    (the default) the entry address is committed into the hash as a
+    final frame; the entry is always reported. Per-segment digests
+    and a normalized manifest mirroring the hashed frames are
+    returned alongside.
+    """
+    parsed = parse_intel_hex(request.hex_text)
+    parse_fields = dict(
+        error_count=parsed.error_count,
+        warning_count=parsed.warning_count,
+        entry_address=parsed.entry_address,
+        total_bytes=parsed.total_bytes,
+        diagnostics=[DiagnosticOut(**vars(d)) for d in parsed.diagnostics],
+    )
+    if not parsed.ok:
+        return ImageDigestResponse(
+            ok=False,
+            hex_ok=False,
+            include_entry=request.include_entry,
+            segment_count=0,
+            image_sha256=None,
+            segments=[],
+            manifest=None,
+            **parse_fields,
+        )
+
+    result = compute_image_digest(
+        parsed.segments, parsed.entry_address, request.include_entry
+    )
+    return ImageDigestResponse(
+        ok=True,
+        hex_ok=True,
+        include_entry=request.include_entry,
+        segment_count=len(result.segments),
+        image_sha256=result.image_sha256,
+        segments=[
+            SegmentDigestOut(start=s.start, end=s.end, size=s.length, sha256=s.sha256)
+            for s in result.segments
+        ],
+        manifest=result.manifest,
+        **parse_fields,
+    )
