@@ -7,7 +7,9 @@ FastAPI 服务：接收 Intel HEX 文本，逐行校验（字节数 + 二补校�
 逐条回放 NOR Flash 状态、校验其合法性并确认最终映像与目标一致；还能按 Cortex-M 向量表
 语义校验映像中的向量表
 （初始栈顶、复位向量、Thumb 位与 ram/executable 区域归属），或将多个带唯一名称的
-Intel HEX 映像按绝对地址叠加合并（同值归并并记录全部来源、冲突按连续段报告、入口一致性校验）。
+Intel HEX 映像按绝对地址叠加合并（同值归并并记录全部来源、冲突按连续段报告、入口一致性校验），
+以及对组装后的整像计算**与记录分片/空洞表示无关的规范化内容指纹（SHA-256）**，
+同时返回每段摘要、总字节数、入口地址与规范化清单。
 
 ## 快速启动（单条命令）
 
@@ -15,12 +17,33 @@ Intel HEX 映像按绝对地址叠加合并（同值归并并记录全部来源�
 docker compose up --build
 ```
 
+首次运行会构建镜像（安装 `requirements.txt` 中的 FastAPI/uvicorn 依赖）并启动服务；
+前台运行时直接 `Ctrl-C` 停止。常用变体：
+
+```bash
+docker compose up --build -d      # 后台运行
+docker compose logs -f            # 跟踪后台日志
+docker compose down               # 停止并移除容器
+docker compose up --build --force-recreate   # 改完代码后强制重建
+```
+
 服务监听容器内 **8000 端口**，compose 映射到宿主机同端口（`-p 8000:8000`，
 可用 `localhost:8000` 或 `127.0.0.1:8000` 访问；换端口只需改映射左侧）。
+例如改用宿主机 18000 端口：把 `docker-compose.yml` 中的 `"8000:8000"`
+改成 `"18000:8000"`，或直接运行
+`docker run --rm -p 18000:8000 hexasm`。
 启动后访问：
 
 - 接口文档（Swagger UI）：<http://localhost:8000/docs>
 - 健康检查：<http://localhost:8000/health>
+
+快速验证服务（指纹接口）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/image-digest \
+  -H 'Content-Type: application/json' \
+  -d '{"hex_text": ":10000000214601360121470136007EFE09D2190141\n:00000001FF\n"}' | jq .image_sha256
+```
 
 不使用 Compose 时：
 
@@ -600,6 +623,95 @@ curl -s -X POST http://localhost:8000/api/v1/merge-images \
 - 冲突与 `entry_conflict` 可同时出现；只要任一存在，`ok=false` 且不生成
   `merged_segments` 字段。
 
+### `POST /api/v1/image-digest`
+
+固件内容指纹：复用同一 Intel HEX 解析器组装映像后，把**稀疏段按地址升序编码为
+明确的「地址 + 长度 + 字节」帧序列**，并对规范化字节流计算**整像 SHA-256**。
+由于只有「绝对地址 + 字节内容」参与哈希，**同一逻辑映像无论怎样切分数据记录、
+怎样表示段间空洞（空洞不写入哈希流），指纹都相同**；段自身的帧哈希也绑定地址，
+放到不同地址的相同字节段摘要不同。
+
+请求体在 `hex_text` 之外接受可选 `include_entry`（**默认 `true`**）：
+为 `true` 时在段帧之后附加入口帧（无入口记录则附加显式「无入口」标记，
+避免「无入口」与「未编码入口」混淆）；为 `false` 时**入口地址不参与整像哈希**，
+仅散列字节与其安放位置。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/image-digest \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "hex_text": ":020000040800F2\n:10000000214601360121470136007EFE09D2190141\n:04000005080001C12D\n:00000001FF\n",
+    "include_entry": true
+  }' | jq
+```
+
+规范化字节流（整数一律大端、无符号 64 位）：
+
+```
+魔数                          = b"firmware-image-digest/v1\n"
+段帧（按地址升序，可多个）     = 0x01 || start:u64 || length:u64 || data[length]
+入口帧（include_entry 且有入口）= 0x02 || address:u64
+无入口标记（include_entry 且无）= 0x03
+整像哈希                       = SHA-256(魔数 || 各段帧 || 入口帧/无入口标记?)
+每段摘要                       = SHA-256(该段帧)        # 绑定地址、长度与字节
+```
+
+段帧/入口帧用不同标记字节区分，任何一种形状的字节流都不可能被重新解释成另一种。
+响应（恒为 200）：
+
+```json
+{
+  "ok": true,
+  "error_count": 0,
+  "warning_count": 0,
+  "entry_address": 134218177,
+  "include_entry": true,
+  "total_bytes": 16,
+  "image_sha256": "02e4d70d437ce18cdb7c87b204db8fcfba6e1e8af2b0f296864859ba2df93d35",
+  "segments": [
+    {"index": 0, "start": 134217728, "end": 134217744, "size": 16,
+     "gap_before": 0,
+     "sha256": "20e1b9b903cbcc066417ba21c589e70fac8c4ce93ba2a3cfdb0ed5ed7f33f1f8"}
+  ],
+  "manifest": {
+    "format": "firmware-image-digest/v1",
+    "hash_algorithm": "sha256",
+    "include_entry": true,
+    "segment_count": 1,
+    "total_bytes": 16,
+    "frame_count": 2,
+    "canonical_bytes": 67,
+    "frames": [
+      {"kind": "segment", "index": 0, "start": 134217728, "end": 134217744,
+       "size": 16,
+       "sha256": "20e1b9b903cbcc066417ba21c589e70fac8c4ce93ba2a3cfdb0ed5ed7f33f1f8",
+       "address": null},
+      {"kind": "entry", "index": null, "start": null, "end": null,
+       "size": null, "sha256": null, "address": 134218177}
+    ]
+  },
+  "diagnostics": [ ... ]
+}
+```
+
+- `image_sha256`：整像指纹，即对上述规范化字节流的 SHA-256。
+- `segments[]`：每段摘要，`sha256` 为该段**规范化帧**（标记 + 地址 + 长度 + 字节）
+  的哈希；`gap_before` 为与上一段之间的空洞字节数（首段为 0），空洞只用于描述、
+  不进入哈希流。
+- `entry_address`：最后一个 03/05 记录给出的入口（无则 `null`）；
+  `include_entry=false` 时入口仍在响应中回显，只是不参与哈希。
+- `manifest`：规范化清单，逐帧列出实际参与哈希的内容（`frames[]` 的
+  `kind` 为 `segment` / `entry` / `no_entry`），并给出格式名、算法、
+  `frame_count` 与 `canonical_bytes`（被哈希字节流的精确长度），便于独立复核。
+- **HEX 解析失败时只返回逐行 `diagnostics`**：`ok=false`、`image_sha256` 与
+  `manifest` 为 `null`、`segments` 为空、`total_bytes` 为 0，不产出任何摘要。
+  纯警告（如空行、相同字节重写）不影响指纹。
+
+同映像不同表示的指纹一致性（示意）：把 16 字节拆成 1 条记录或 3 条记录，
+`image_sha256` 完全相同；`include_entry` 在两种表示上分别取默认值或 `false`
+时也各自相同。只改一个字节、移动安放地址或改变入口地址才会改变默认指纹；
+其中仅改变入口地址时，`include_entry=false` 的「字节/安放」指纹保持不变。
+
 ## 解析规则
 
 - 每行必须形如 `:llaaaatt<data>cc`；校验 `ll`（字节数）与实际数据长度一致，
@@ -627,6 +739,7 @@ app/
   flash_verify.py # 擦/写操作序列回放校验（逐条合法性、1->0 语义、目标差异合并，纯逻辑）
   vector_table.py # Cortex-M 向量表校验（小端读取、栈顶/复位/Thumb 位与区域归属，纯逻辑）
   image_merge.py  # 多映像按绝对地址叠加合并（同值归并、冲突段报告、入口一致性，纯逻辑）
+  image_digest.py # 整像内容指纹（段帧规范化编码 + 整像/每段 SHA-256 + 规范化清单，纯逻辑）
 tests/
   test_hex_service.py           # 解析器与 assemble 接口
   test_validate_layout.py       # validate-layout 接口与布局逻辑
@@ -635,6 +748,7 @@ tests/
   test_verify_flash_operations.py # verify-flash-operations 接口与回放校验逻辑
   test_validate_vector_table.py # validate-vector-table 接口与向量表校验逻辑
   test_merge_images.py          # merge-images 接口与多映像合并逻辑
+  test_image_digest.py          # image-digest 接口与内容指纹逻辑（分片/空洞不变性等）
 Dockerfile
 docker-compose.yml
 requirements.txt       # 运行依赖

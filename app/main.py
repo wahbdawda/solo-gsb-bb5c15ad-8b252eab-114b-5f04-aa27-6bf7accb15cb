@@ -10,6 +10,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, model_validator
 
 from .hex_parser import ParseResult, parse_intel_hex
+from .image_digest import build_image_digest
 from .image_merge import MergeSource, merge_images
 from .layout import Region, validate_layout
 from .relocation import plan_relocation
@@ -35,8 +36,10 @@ app = FastAPI(
         "delta whose feasible range is computed against those regions, "
         "diffed against another image to plan NOR-flash erase/write steps, "
         "replayed from a user-supplied ordered erase/write sequence to verify "
-        "it reaches that target, or read as a Cortex-M vector table checked "
-        "against ram/executable memory regions."
+        "it reaches that target, read as a Cortex-M vector table checked "
+        "against ram/executable memory regions, or fingerprinted with a "
+        "canonical whole-image SHA-256 that is stable across record "
+        "splitting and gap representations."
     ),
 )
 
@@ -716,6 +719,97 @@ class MergeImagesResponse(BaseModel):
     )
 
 
+class ImageDigestRequest(BaseModel):
+    hex_text: str = Field(..., description="Intel HEX text, one record per line")
+    include_entry: bool = Field(
+        True,
+        description=(
+            "Whether the entry address participates in the whole-image hash "
+            "(default true; false hashes bytes and placement only)"
+        ),
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "hex_text": (
+                        ":020000040800F2\n"
+                        ":10000000214601360121470136007EFE09D2190141\n"
+                        ":04000005080001C12D\n"
+                        ":00000001FF\n"
+                    ),
+                    "include_entry": True,
+                }
+            ]
+        }
+    }
+
+
+class SegmentDigestOut(BaseModel):
+    index: int = Field(..., description="Zero-based position in address order")
+    start: int = Field(..., description="Absolute start address")
+    end: int = Field(..., description="Exclusive end address")
+    size: int
+    gap_before: int = Field(
+        ...,
+        description="Uncovered bytes between the previous segment and this one (0 for index 0)",
+    )
+    sha256: str = Field(
+        ...,
+        description="SHA-256 of this segment's canonical frame (tag + start + length + bytes)",
+    )
+
+
+class CanonicalFrameOut(BaseModel):
+    kind: str = Field(..., description="segment | entry | no_entry")
+    index: int | None = Field(None, description="Segment index for segment frames")
+    start: int | None = Field(None, description="Segment start for segment frames")
+    end: int | None = Field(None, description="Exclusive segment end for segment frames")
+    size: int | None = Field(None, description="Segment byte count for segment frames")
+    sha256: str | None = Field(None, description="Frame SHA-256 for segment frames")
+    address: int | None = Field(None, description="Entry address for the entry frame")
+
+
+class CanonicalManifestOut(BaseModel):
+    format: str = Field(..., description="Canonical encoding format identifier")
+    hash_algorithm: str
+    include_entry: bool = Field(..., description="Whether the entry frame is part of the stream")
+    segment_count: int
+    total_bytes: int
+    frame_count: int = Field(..., description="Number of frames listed and fed to the hash")
+    canonical_bytes: int = Field(
+        ..., description="Total byte length of the canonical stream that was hashed"
+    )
+    frames: list[CanonicalFrameOut] = Field(
+        ..., description="Frames in hashing order (segments ascending, then entry marker)"
+    )
+
+
+class ImageDigestResponse(BaseModel):
+    ok: bool = Field(..., description="True when no error-level diagnostic was raised")
+    error_count: int
+    warning_count: int
+    entry_address: int | None = Field(
+        None, description="From the last 03/05 record, if present; null when parsing failed"
+    )
+    include_entry: bool = Field(
+        ..., description="Echoes the request; when false no entry frame entered the hash"
+    )
+    total_bytes: int = Field(..., description="Sum of segment byte counts (0 when parsing failed)")
+    image_sha256: str | None = Field(
+        None,
+        description="Whole-image SHA-256 over the canonical stream; null when parsing failed",
+    )
+    segments: list[SegmentDigestOut] = Field(
+        ..., description="Per-segment summaries in address order; empty when parsing failed"
+    )
+    manifest: CanonicalManifestOut | None = Field(
+        None, description="Normalized description of exactly what was hashed; null on failure"
+    )
+    diagnostics: list[DiagnosticOut]
+
+
 def _build_response(result: ParseResult) -> AssembleResponse:
     return AssembleResponse(
         ok=result.ok,
@@ -758,6 +852,88 @@ def assemble(request: AssembleRequest) -> AssembleResponse:
 def assemble_raw(hex_text: str = Body(..., media_type="text/plain")) -> AssembleResponse:
     """Assemble a firmware image from a raw Intel HEX text body (text/plain)."""
     return _build_response(parse_intel_hex(hex_text))
+
+
+@app.post("/api/v1/image-digest", response_model=ImageDigestResponse, tags=["digest"])
+def image_digest_route(request: ImageDigestRequest) -> ImageDigestResponse:
+    """Fingerprint an assembled firmware image with a canonical SHA-256.
+
+    The HEX text is parsed with the shared validator and the same
+    diagnostics are returned. When parsing fails no digest is produced:
+    ``image_sha256``/``manifest`` are null and ``segments`` is empty.
+    Otherwise the sparse, address-ordered segments are encoded as
+    explicit self-delimiting frames (segment tag, 64-bit absolute start,
+    64-bit length, raw bytes), optionally followed by an entry frame
+    (``include_entry``, default true), and the resulting canonical
+    stream is hashed with SHA-256. Because only absolute placement and
+    byte content enter the stream, different record splitting or gap
+    representations of the same image hash identically. Per-segment
+    frame hashes, total byte count, the entry address and a normalized
+    manifest of every hashed frame are returned as well.
+    """
+    parsed = parse_intel_hex(request.hex_text)
+    diagnostics = [DiagnosticOut(**vars(d)) for d in parsed.diagnostics]
+    if not parsed.ok:
+        return ImageDigestResponse(
+            ok=False,
+            error_count=parsed.error_count,
+            warning_count=parsed.warning_count,
+            entry_address=None,
+            include_entry=request.include_entry,
+            total_bytes=0,
+            image_sha256=None,
+            segments=[],
+            manifest=None,
+            diagnostics=diagnostics,
+        )
+
+    digest = build_image_digest(
+        parsed.segments,
+        parsed.entry_address,
+        include_entry=request.include_entry,
+    )
+    return ImageDigestResponse(
+        ok=True,
+        error_count=parsed.error_count,
+        warning_count=parsed.warning_count,
+        entry_address=digest.entry_address,
+        include_entry=digest.include_entry,
+        total_bytes=digest.total_bytes,
+        image_sha256=digest.image_sha256,
+        segments=[
+            SegmentDigestOut(
+                index=segment.index,
+                start=segment.start,
+                end=segment.end,
+                size=segment.size,
+                gap_before=segment.gap_before,
+                sha256=segment.sha256,
+            )
+            for segment in digest.segments
+        ],
+        manifest=CanonicalManifestOut(
+            format=digest.manifest.format,
+            hash_algorithm=digest.manifest.hash_algorithm,
+            include_entry=digest.manifest.include_entry,
+            segment_count=digest.manifest.segment_count,
+            total_bytes=digest.manifest.total_bytes,
+            frame_count=digest.manifest.frame_count,
+            canonical_bytes=digest.manifest.canonical_bytes,
+            frames=[
+                CanonicalFrameOut(
+                    kind=frame.kind,
+                    index=frame.index,
+                    start=frame.start,
+                    end=frame.end,
+                    size=frame.size,
+                    sha256=frame.sha256,
+                    address=frame.address,
+                )
+                for frame in digest.manifest.frames
+            ],
+        ),
+        diagnostics=diagnostics,
+    )
 
 
 @app.post("/api/v1/validate-layout", response_model=ValidateLayoutResponse, tags=["layout"])
